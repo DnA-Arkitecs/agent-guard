@@ -1,0 +1,48 @@
+{
+  "home": "/home/agent",
+  "workspace": "/workspace",
+  "defaults": {
+    "read_roots": [
+      "/workspace"
+    ],
+    "write_roots": [
+      "/workspace"
+    ],
+    "allowed_hosts": [
+      "api.example.com",
+      "docs.example.com"
+    ],
+    "allowed_recipients": [
+      "*@example.com"
+    ],
+    "sql_mode": "scoped_write",
+    "egress": "taint-aware"
+  },
+  "agents": {
+    "support-agent": {
+      "allowed_tools": [
+        "Read",
+        "Grep",
+        "Bash",
+        "Write",
+        "execute_sql",
+        "send_email",
+        "read_email",
+        "WebFetch"
+      ],
+      "max_outbound_per_session": 3
+    },
+    "analyst-agent": {
+      "allowed_tools": [
+        "Read",
+        "Grep",
+        "Bash",
+        "execute_sql"
+      ],
+      "sql_mode": "read_only",
+      "write_roots": [
+        "/workspace/scratch"
+      ]
+    }
+  }
+}
