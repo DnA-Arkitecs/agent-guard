@@ -35,7 +35,8 @@ RESULT          : ALL PASS
 ```
 
 A hostile call counts only if it is blocked *by the rule meant to catch it*; blocked for a lucky side reason is a
-miss. Latency varies by machine and run; three back-to-back runs on the machine above stayed within 2%. Every payload is
+miss. Latency varies by machine and load: five runs on the machine above ranged p50 161 to 188 us and p99 422 to 459 us,
+always under 0.5 ms. Every payload is
 synthetic (reserved example domains, a documented example key shape assembled at run time).
 
 ### What changed in v1.1
