@@ -4,9 +4,10 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shlex
 from typing import Any, Dict, List, Optional
 
-from . import exfil, heredoc, paths
+from . import exfil, heredoc, normalize, paths
 from .policy import AgentPolicy, Policy
 from .secrets import contains_env_secret, find_secrets, walk_strings
 from .session import Session
@@ -54,6 +55,9 @@ class Guard:
             return Decision(False, findings, agent, tool)
 
         roles = self.policy.roles(tool)
+        # Judge the meaning, not the spelling: refuse look-alike spellings that folding would hide, then fold.
+        findings += normalize.spelling_findings(tool_input, roles, _PATH_KEYS)
+        tool_input = normalize.fold_input(tool_input)
         cwd = str(tool_input.get("cwd") or self.policy.workspace)
         write_roots = self.policy.normalized_roots(ap.write_roots)
         read_roots = self.policy.normalized_roots(ap.read_roots)
@@ -74,6 +78,8 @@ class Guard:
                     findings += exfil.url_egress(tool_input[k], str(tool_input.get("method", "GET")), ap, session)
         if roles & {"shell", "message", "url"}:
             findings += self._secrets(tool_input)
+        if roles & {"shell", "sql", "message", "url"}:
+            findings += self._decoded(tool_input, roles, ap, session, ctx)
 
         findings = _dedupe(findings)
         decision = Decision(not findings, findings, agent, tool)
@@ -148,6 +154,23 @@ class Guard:
             elif contains_env_secret(s):
                 out.append(Finding("secret-in-payload", "payload carries the value of a secret environment variable", "secret"))
         return out
+
+
+    def _decoded(self, tool_input, roles, ap: AgentPolicy, session: Session, ctx: ShellContext) -> List[Finding]:
+        """Base64 hidden anywhere in the call is decoded and judged by the same rules as plain text."""
+        inner: List[Finding] = []
+        for _, s in normalize.walk(tool_input):
+            for text in normalize.decoded_payloads(s):
+                text = normalize.fold(text)
+                if find_secrets(text):
+                    inner.append(Finding("secret-in-payload", "secret", "secret"))
+                if roles & {"shell", "sql"} and normalize.looks_like_sql(text):
+                    inner += check_sql(text, ap.sql_mode)
+                if "shell" in roles:
+                    inner += self._shell({"command": text}, ap, session, ctx)
+                    inner += check_shell("python3 -c " + shlex.quote(text), ctx)  # decoded inline code
+        rules = dict.fromkeys(f.rule for f in inner if f.rule not in ("sql-unterminated", "heredoc-unterminated"))
+        return [Finding("evasion-base64-payload", f"Base64 hides a blocked payload ({r})", "evasion") for r in rules]
 
 
 def _dedupe(findings: List[Finding]) -> List[Finding]:

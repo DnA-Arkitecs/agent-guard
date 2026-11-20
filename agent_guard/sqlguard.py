@@ -1,6 +1,7 @@
 """Destructive-SQL firewall. Deterministic: tokenises the statement text and judges it, never asks a model.
 
-Blocks DROP / TRUNCATE, DELETE and UPDATE without a real WHERE (missing, or a tautology such as `1=1`), stacked
+Blocks DROP / TRUNCATE, DELETE and UPDATE without a real WHERE (missing, or a tautology such as `1=1`, `'a'='a'`,
+`"a"="a"`, `2>1`, `OR true`), stacked
 statements that smuggle one of those behind a harmless first statement, and a short list of server-side escape
 hatches (file read/write, program execution, privilege grants, dynamic SQL).
 
@@ -11,13 +12,14 @@ not, nested block comments or not) and the verdict is the union: if any reading 
 from __future__ import annotations
 
 import itertools
+import operator
 import re
 from typing import Iterable, List, Optional, Tuple
 
 from .types import Finding
 
 _TOKEN = re.compile(
-    r"\$\d+|:[A-Za-z_]\w*|%s|\?|@\w+|[A-Za-z_][A-Za-z0-9_$]*|\d+(?:\.\d+)?|<>|!=|>=|<=|=|[();,*.<>+\-/%]|\S"
+    r"'x'|\"q\"|\$\d+|:[A-Za-z_]\w*|%s|\?|@\w+|[A-Za-z_][A-Za-z0-9_$]*|\d+(?:\.\d+)?|<>|!=|>=|<=|=|[();,*.<>+\-/%]|\S"
 )
 
 ESCAPE_HATCHES = {
@@ -27,7 +29,10 @@ ESCAPE_HATCHES = {
     "lo_export": "server file write", "outfile": "server file write", "dumpfile": "server file write",
     "shutdown": "server shutdown",
 }
-READ_ONLY_FIRST = {"SELECT", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "VALUES", "PRAGMA", "TABLE"}
+_NUMBER = re.compile(r"^\d+(?:\.\d+)?$")
+_COMPARE = {"=": operator.eq, "<>": operator.ne, "!=": operator.ne, ">": operator.gt, "<": operator.lt,
+            ">=": operator.ge, "<=": operator.le}
+READ_ONLY_FIRST ={"SELECT", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "VALUES", "PRAGMA", "TABLE"}
 
 
 def _sanitise(sql: str, backslash: bool, dashes: bool, nested: bool) -> Optional[str]:
@@ -112,8 +117,12 @@ def _is_tautology(disjunct: List[str]) -> bool:
     toks = [t.upper() for t in disjunct]
     if not toks:
         return False
-    if toks in (["TRUE"], ["1"], ["NOT", "FALSE"], ["NOT", "0"]):
+    if toks in (["TRUE"], ["NOT", "FALSE"], ["NOT", "0"]):
         return True
+    if len(toks) == 1 and _NUMBER.match(toks[0]):
+        return float(toks[0]) != 0  # `WHERE 1`, `WHERE 7`: any non-zero constant is true
+    if len(toks) == 3 and _NUMBER.match(toks[0]) and _NUMBER.match(toks[2]) and toks[1] in _COMPARE:
+        return _COMPARE[toks[1]](float(toks[0]), float(toks[2]))  # `2>1`, `1<>2`: two constants compared
     if len(toks) == 3 and toks[1] == "=" and toks[0] == toks[2] and toks[0] not in ("?", "%S"):
         return not toks[0].startswith((":", "$", "@"))  # `1=1`, `x=x`, `'x'='x'`; a bind parameter is not one
     if len(toks) == 4 and toks[1:] == ["IS", "NOT", "NULL"]:

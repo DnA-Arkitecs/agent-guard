@@ -1,4 +1,4 @@
-"""Command line: --demo, check, hook, scan, sql, policy."""
+"""Command line: --demo, --benchmark, check, hook, scan, sql, policy."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import sys
 from typing import List, Optional
 
 from . import __version__
+from .benchmark import render_benchmark, run_benchmark
 from .guard import Guard
 from .hook import run_hook
 from .injection import clean_untrusted
@@ -24,6 +25,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="agent_guard", description="Deterministic pre-execution firewall for AI agents.")
     ap.add_argument("--version", action="version", version=__version__)
     ap.add_argument("--demo", action="store_true", help="replay benign + 20 hostile payloads through the guard")
+    ap.add_argument("--benchmark", action="store_true",
+                    help="red-team suite: 50 hostile calls over 6 vectors + 40 benign, p50/p95/p99 latency")
+    ap.add_argument("--rounds", type=int, default=200, help="replay rounds for --benchmark (default 200)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -50,6 +54,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("policy", help="print the built-in demo policy as JSON (a starting point for your own)")
 
     args = ap.parse_args(argv)
+    if args.benchmark:
+        report = run_benchmark(args.rounds)
+        if args.json:
+            skip = ("misses", "false_positive_cases")
+            print(json.dumps({k: v for k, v in report.items() if k not in skip} | {
+                "misses": [r.case.id for r in report["misses"]],
+                "false_positive_cases": [r.case.id for r in report["false_positive_cases"]]}, indent=2))
+        else:
+            print(render_benchmark(report))
+        return 0 if report["ok"] else 1
     if args.demo:
         report = run_replay()
         if args.json:

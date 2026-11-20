@@ -8,26 +8,82 @@ way past a rule. No model is consulted, no network is touched, there are zero th
 decision takes about 0.2 ms.
 
 ```bash
-python -m agent_guard --demo   # replay benign work + 20 hostile payloads through the real guard
-pytest -q                      # 120+ tests
+python -m agent_guard --benchmark   # red-team suite: 50 hostile calls over 6 vectors + 40 benign, p50/p95/p99
+python -m agent_guard --demo        # quick replay: 20 hostile + 18 benign
+pytest -q                           # 175 tests
 ```
 
+## v1.1 red-team benchmark
+
+50 hostile calls across six attack vectors and 40 realistic engineering and ops calls (npm, make, docker,
+kubectl, git, jq, JOIN reports, scoped DELETE/UPDATE, Basic-auth headers, accented, Greek and Cyrillic text),
+replayed 200 rounds through the real guard (18,000 timed decisions, one Windows 11 desktop, Python 3.12):
+
 ```text
-hostile blocked : 20/20
-benign allowed  : 18/18
-latency         : median ~160 us per decision
+VECTOR                 BLOCKED
+injection-exfil            8/8
+destructive-sql          10/10
+dangerous-shell            9/9
+credential-theft           7/7
+encoding-evasion         10/10
+scope-escape               6/6
+
+true positives  : 50/50 (100.0%) blocked for the expected reason
+false positives : 0/40 (0.0%) benign calls blocked
+latency         : p50 161 us | p95 311 us | p99 424 us per decision
 RESULT          : ALL PASS
 ```
+
+A hostile call counts only if it is blocked *by the rule meant to catch it*; blocked for a lucky side reason is a
+miss. Latency varies by machine and run; three back-to-back runs on the machine above stayed within 2%. Every payload is
+synthetic (reserved example domains, a documented example key shape assembled at run time).
+
+### What changed in v1.1
+
+- **SQL tautology tokenizer fix.** The sanitiser turns every string literal into a placeholder, and the tokenizer
+  used to split that placeholder into three tokens, so `DELETE FROM t WHERE 'a'='a'` passed. Placeholders are now
+  single tokens: `'a'='a'`, `'a' = 'a' OR id=5`, `"a"="a"`, backtick identifiers, `WHERE /**/ 'a'='a'`, `2>1`,
+  `1<>2` and `WHERE 7` all block, while `WHERE id = 5 AND status = 'active'` and `WHERE name = 'bob'` still pass.
+  Comparing two literals is judged conservatively: `'a'='b'` also blocks (fail-closed).
+- **Evasion normalisation (`normalize.py`).** Before any rule runs, zero-width and bidi characters and the BOM are
+  stripped, NFKC folds fullwidth letters, and Cyrillic/Greek look-alikes map to ASCII, so `r<ZWSP>m -rf /`,
+  `ｒｍ -rf /` and `DRΟP TABLE` are judged as what they mean. A word mixing ASCII with look-alike letters, or a host
+  that only reads as allowlisted after folding (`api.exаmple.com`), is refused outright. Pure Greek or Cyrillic
+  words are ordinary language and pass.
+- **Base64 inspection.** Blobs handed to `base64 -d`, `atob(...)`, `b64decode(...)`, `FromBase64String(...)` or
+  `powershell -EncodedCommand` (UTF-16LE), and any readable 16+ character blob, are decoded up to two layers deep
+  and judged by the same shell, SQL and secret rules (`evasion-base64-payload`). Decoding never executes anything;
+  a harmless decode (`echo aGVsbG8gd29ybGQ= | base64 -d`) still passes.
+- **`--benchmark`** with per-vector block rates, false-positive rate and p50/p95/p99 latency.
+
+## Threat-model boundary
+
+What a deterministic pre-execution guard can and cannot promise. The left column runs in under 0.5 ms with no
+model; the right column needs architecture, not a smarter filter.
+
+| Caught deterministically, before the tool runs | Not caught here: needs tool scoping and isolation |
+|---|---|
+| A call whose **text** is destructive: `DROP`, unscoped or tautological `DELETE`/`UPDATE`, `rm -rf /`, `curl \| sh`, force-push, disk writes | A call that is **valid but wrong**: `DELETE FROM orders WHERE id = 42` on the wrong id, a well-formed refund to the wrong customer |
+| Egress to a host or recipient **off the allowlist**, or one that **untrusted text named** | Data leaked **to an allowlisted destination** in a form no rule recognises (paraphrased, summarised, split across calls) |
+| Secrets in a payload by **known shape** or **live environment value**, plain or Base64-wrapped | Secrets in an unknown format, or re-encoded with a scheme other than Base64 (hex, ROT13, custom XOR) |
+| **Spelling tricks**: zero-width characters, fullwidth and Cyrillic/Greek look-alikes, Base64 up to two layers | Code that **builds** the payload at run time (`"r"+"m"`, string reversal, a downloaded script that is clean today and hostile tomorrow) |
+| Paths outside the agent's **read/write roots**, credential files, traversal | Symlinks and race conditions on the real filesystem (checks are string-based by design: same verdict on every machine) |
+| Tools **not granted** to the agent at all | **Multi-turn persuasion**: an agent talked, over several harmless-looking steps, into a goal the policy allows each step of |
+
+The guarantee is narrow and testable: whatever a model is persuaded to want, a call the policy forbids does not
+run. Defending the right column means giving each agent the fewest tools, the narrowest roots and allowlists, and
+an OS-level sandbox; agent-guard is the layer that makes those limits hold at call time.
 
 ## What it stops
 
 | Threat | How it is stopped (deterministically) |
 |---|---|
 | **Prompt-injection exfiltration** from untrusted web / e-mail text | Session **taint**: after the agent reads untrusted text, outbound actions are allowlist-only, `cc`/`bcc` and fan-out are refused, and any address or host that *the untrusted text itself named* is refused by name. Hidden HTML, zero-width characters and image beacons are stripped or blocked. |
-| **Destructive SQL** | `DROP`, `TRUNCATE`, `DELETE`/`UPDATE` with no `WHERE` or with an always-true one (`1=1`, `OR true`, `IS NOT NULL`), stacked statements, `MERGE`, file/exec escape hatches. Comment and string-escape dialect ambiguities are judged under every reading; any destructive reading blocks. |
+| **Destructive SQL** | `DROP`, `TRUNCATE`, `DELETE`/`UPDATE` with no `WHERE` or with an always-true one (`1=1`, `'a'='a'`, `"a"="a"`, `2>1`, `OR true`, `IS NOT NULL`), stacked statements, `MERGE`, file/exec escape hatches. Comment and string-escape dialect ambiguities are judged under every reading; any destructive reading blocks. |
 | **Dangerous shell** | `rm -rf` of protected or out-of-scope targets, `curl \| sh`, force-push, `reset --hard`, disk writes, `sudo`, container escapes, fork bombs, recursive `chmod`, bulk infrastructure deletes. Nested payloads (`bash -c`, `eval`, `ssh host CMD`, `$(...)`, `find -exec`) are parsed recursively. |
 | **Credential and secret theft** | Reads of key files, `.env`, cloud credential directories; environment dumps; `$SECRET_TOKEN` references; known key shapes and live secret environment values in any outbound payload. |
 | **Unsafe multi-line heredocs** | Body fed to an interpreter (`python3 - <<EOF`, `bash <<EOF`, `ssh host <<EOF`), body written to an executable script or a startup/scheduler/key-trust file, unterminated heredocs. Bodies fed to a database client are handed to the SQL firewall; safe shapes (`git commit -m "$(cat <<'EOF' ...)"`, notes files) pass. |
+| **Encoding and spelling evasion** | Zero-width/bidi characters stripped, NFKC plus Cyrillic/Greek look-alike folding before every rule; mixed-script words and look-alike hosts refused; Base64 (including PowerShell `-EncodedCommand`) decoded two layers deep and judged by the same rules. |
 | **Scope creep** | Per-agent **tool allowlists**, read/write **path roots** (traversal-proof, no filesystem access), host and recipient allowlists, outbound caps. |
 
 ## Architecture
@@ -37,7 +93,8 @@ flowchart LR
     A[Agent tool call] --> H[PreToolUse hook<br/>python -m agent_guard hook]
     W[Web / e-mail tool result] --> P[PostToolUse hook]
     P -->|taint + attacker-named destinations| S[(Session state<br/>JSON per session)]
-    H --> G[Guard.check]
+    H --> N[normalize<br/>fold + Base64 decode]
+    N --> G[Guard.check]
     S --> G
     PO[(policy.json<br/>per-agent allowlists)] --> G
     G --> T{tool allowlist}
@@ -106,14 +163,17 @@ load time so a typo cannot silently weaken a rule.
 - Path checks are string-based (no symlink resolution) so verdicts are identical on every machine.
 - A model that reads untrusted text can still be *persuaded*; the guarantee is that persuasion cannot reach a
   destination, file, command or statement the policy forbids.
+- The 90-call benchmark is the author's own corpus. It proves the rules do what they claim; it is not an outside
+  red-team. Bypasses are welcome as issues: each confirmed one becomes a benchmark case and a test.
 - Rules are conservative on purpose. A blocked benign call is cheap (add the host to the allowlist); an allowed
   hostile one is not.
 
 ## Layout
 
 ```text
-agent_guard/   guard.py (orchestrator)  sqlguard.py  shellguard.py  heredoc.py  exfil.py  injection.py
-               session.py (taint)  policy.py  paths.py  secrets.py  hook.py  audit.py  replay.py (benchmark)  cli.py
+agent_guard/   guard.py (orchestrator)  normalize.py (evasion)  sqlguard.py  shellguard.py  heredoc.py  exfil.py
+               injection.py  session.py (taint)  policy.py  paths.py  secrets.py  hook.py  audit.py
+               replay.py (--demo)  benchmark.py (--benchmark)  cli.py
 test_agent_guard.py
 policy.example.json
 ```

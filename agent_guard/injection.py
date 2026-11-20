@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set
 from urllib.parse import urlsplit
 
+from .normalize import FOLD_TABLE
+
 # Zero-width and bidi controls, soft hyphen, invisible fillers, and the Unicode "tag" block that smuggles ASCII.
 _INVISIBLE = re.compile(
     "[­ᅟᅠ᠎​-‏‪-‮⁠-⁤⁦-⁩ㅤ﻿ﾠ]"
@@ -156,8 +158,9 @@ def clean_untrusted(text: str, max_len: int = 20000) -> CleanResult:
     raw = _CONTROL.sub("", _INVISIBLE.sub("", raw))
     truncated = len(raw) > max_len
     raw = raw[:max_len]
+    probe = raw.translate(FOLD_TABLE)  # `ignоre` with a Cyrillic о still reads as `ignore` to the patterns
     for name, rx in INJECTION_PATTERNS.items():
-        if rx.search(raw):
+        if rx.search(probe):
             flags.append(name)
     return CleanResult(raw, flags, hidden, invisible, truncated)
 
