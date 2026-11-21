@@ -300,7 +300,12 @@ _GLOB_DANGER = {".", "..", "*", ".*", "./", "../", "./*", "../*", "~", "~/", "~/
                 "${home}/*"}
 _INLINE_RISK = re.compile(r"shutil\.rmtree|rmtree|os\.system|os\.(?:remove|unlink|rmdir)|subprocess|\bsocket\b|urllib|requests\.|"
                           r"http\.client|\bexecSync\b|child_process|fs\.rm|fs\.unlink|rimraf|Remove-Item|Invoke-WebRequest|"
-                          r"\bsystem\s*\(|\bexec\s*\(|\bqx\b|popen|\bspawn\b|File::Path")
+                          r"\bsystem\s*\(|\bexec\s*\(|\bqx\b|popen|\bspawn\b|File::Path|"
+                          # perl / ruby / php one-liners: unlink glob "/*", FileUtils.rm_rf, File.delete, %x(...), `...`
+                          r"\bunlink\b|\brmdir\b|\brmtree\b|FileUtils\.|\brm_r|File\.(?:delete|unlink)|Dir\.(?:rmdir|delete|unlink)|"
+                          r"\bsystem\s+[\"'$]|\bexec\s+[\"'$]|\bKernel\.|\bIO\.popen|\bshell_exec\b|\bpassthru\b")
+_SHELL_OUT = re.compile(r"`|%x[({\[]")  # perl / ruby / php backticks and %x(...) run a shell command
+_INLINE_FLAG = {"-c", "-e", "-r", "--eval", "-command", "-p", "--print"}
 _INLINE_CRED = re.compile(r"\.ssh\b|\.aws\b|id_rsa|id_ed25519|/etc/shadow|\.netrc|\.pgpass|\.git-credentials|\.env\b|credentials\.json", re.I)
 _GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 
@@ -370,6 +375,52 @@ def _git_sub(args: List[str]) -> Tuple[str, List[str]]:
     return "", []
 
 
+_PROTECTED_BRANCH = re.compile(r"^(?:main|master|trunk|develop|dev|prod|production|release|stable|live|gh-pages)$|"
+                               r"^(?:release|hotfix|prod|production)/", re.I)
+_PUSH_VALUE_FLAGS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option", "--recurse-submodules"}
+
+
+def _protected_branch(ref: str) -> bool:
+    name = re.sub(r"^refs/heads/", "", ref.lstrip("+"))
+    return bool(_PROTECTED_BRANCH.search(name))
+
+
+def _push_targets(rest: List[str]) -> Optional[List[str]]:
+    """Remote branch names a `git push` writes, or None when the command does not name them (current branch,
+    --all, a matching push): a guard cannot know those, so it treats them as protected."""
+    pos, k = [], 0
+    while k < len(rest):
+        r = rest[k]
+        if r in ("--all", "--branches", "--mirror", "--tags") or r.lower().startswith("--force-with-lease=") and \
+                _protected_branch(r.split("=", 1)[1].split(":", 1)[0]):
+            return None
+        if r in _PUSH_VALUE_FLAGS:
+            k += 2
+            continue
+        if not r.startswith("-"):
+            pos.append(r)
+        k += 1
+    refspecs = pos[1:]
+    if not refspecs:
+        return None
+    return [s.rsplit(":", 1)[-1] if ":" in s else s for s in refspecs]
+
+
+def _whole_tree(rest: List[str]) -> bool:
+    return any(p in (".", "./", ":/", "*") for p in rest)
+
+
+def _restores_worktree(rest: List[str]) -> bool:
+    """`git restore` touches the working tree unless only --staged / -S is given (that one just unstages)."""
+    staged = worktree = False
+    for r in rest:
+        if r in ("--staged",) or re.fullmatch(r"-[A-Za-z]*S[A-Za-z]*", r):
+            staged = True
+        if r in ("--worktree",) or re.fullmatch(r"-[A-Za-z]*W[A-Za-z]*", r):
+            worktree = True
+    return worktree or not staged
+
+
 def _check_git(args: List[str], out: List[Finding]) -> None:
     sub, rest = _git_sub(args)
     low = [r.lower() for r in rest]
@@ -379,11 +430,16 @@ def _check_git(args: List[str], out: List[Finding]) -> None:
                 or any(r.startswith("--force=") for r in low) or (len(low) and any(
                     r.startswith("-") and not r.startswith("--") and "f" in r[1:] for r in low)):
             out.append(Finding("shell-git-force-push", "force / mirror / delete push can destroy remote history", "shell"))
+        elif any(r.startswith(("--force-with-lease", "--force-if-includes")) for r in low):
+            targets = _push_targets(rest)
+            if targets is None or any(_protected_branch(t) for t in targets):
+                out.append(Finding("shell-git-force-push", "--force-with-lease on a protected or unnamed branch "
+                                   "still rewrites its remote history", "shell"))
     elif sub == "reset" and "--hard" in low:
         out.append(Finding("shell-git-reset-hard", "git reset --hard discards uncommitted work", "shell"))
     elif sub == "clean" and _flag_cluster(rest, "f", ("--force",)):
         out.append(Finding("shell-git-clean", "git clean -f deletes untracked files", "shell"))
-    elif sub in ("checkout", "restore") and ("." in rest or "--" in rest and "." in rest[rest.index("--"):]):
+    elif sub in ("checkout", "restore") and _whole_tree(rest) and (sub == "checkout" or _restores_worktree(rest)):
         out.append(Finding("shell-git-discard-all", f"git {sub} . discards every uncommitted change", "shell"))
     elif sub == "branch" and ("-D" in rest or "--force" in low and "-d" in low):
         out.append(Finding("shell-git-branch-delete", "forced branch deletion", "shell"))
@@ -527,11 +583,13 @@ def _check_segment(seg: Segment, nxt: Optional[Segment], ctx: ShellContext, out:
     elif (cmd == "npm" and args[:1] == ["publish"]) or (cmd == "twine" and args[:1] == ["upload"]) or \
             (cmd == "cargo" and args[:1] == ["publish"]) or (cmd == "gem" and args[:1] == ["push"]):
         out.append(Finding("shell-publish", "publishes a package outside the machine", "shell"))
-    elif _INTERPRETERS.match(cmd) and any(a in ("-c", "-e", "-r", "--eval", "-Command") for a in args):
+    elif _INTERPRETERS.match(cmd) and any(
+            a.lower() in _INLINE_FLAG or re.fullmatch(r"-[A-Za-z]{1,4}", a) and ("e" in a[1:] or "c" in a[1:])
+            for a in args):  # -c, -e and clusters such as perl -le / -ne / -pe, ruby -ne, python -Bc
         code = " ".join(args)
         if _INLINE_CRED.search(code):
             out.append(Finding("shell-inline-credential-read", "inline code reads a credential path", "shell"))
-        if _INLINE_RISK.search(code):
+        if _INLINE_RISK.search(code) or (cmd in ("perl", "ruby", "php") and _SHELL_OUT.search(code)):
             out.append(Finding("shell-inline-interpreter-risk", "inline code deletes, spawns processes or opens sockets", "shell"))
     # remote code: producer | consumer
     if seg.pipe_next and nxt:
@@ -542,6 +600,70 @@ def _check_segment(seg: Segment, nxt: Optional[Segment], ctx: ShellContext, out:
                 (cons in _SHELLS or cons in _PS or _INTERPRETERS.match(cons or "")):
             if prod in _DOWNLOADERS or prod in _DECODERS:
                 out.append(Finding("shell-pipe-to-interpreter", f"`{prod} | {cons}` runs fetched or decoded text as code", "shell"))
+
+
+_SAVE_FLAGS = {"curl": ("-o", "--output"), "wget": ("-O", "--output-document"), "aria2c": ("-o", "--out"),
+               "iwr": ("-outfile",), "invoke-webrequest": ("-outfile",), "fetch": ("-o",), "http": ("--output", "-o")}
+
+
+def _url_basename(args: List[str]) -> List[str]:
+    return [re.sub(r"[?#].*$", "", a).rstrip("/").rsplit("/", 1)[-1] for a in args if re.match(r"(?i)^(?:https?|ftp)://", a)]
+
+
+def _downloaded(e: Effective, seg: Segment) -> List[str]:
+    """Files a downloader segment writes: -o / -O / --output / -OutFile, a redirect, or wget's / curl -O's URL name."""
+    flags = _SAVE_FLAGS.get(e.cmd)
+    if not flags:
+        return []
+    out, args = [], e.args
+    for k, a in enumerate(args):
+        low = a.lower()
+        for f in flags:
+            if (a == f or f == "-outfile" and low == f) and k + 1 < len(args):  # curl -o and -O differ; PS is caseless
+                out.append(args[k + 1])
+            elif f.startswith("--") and a.startswith(f + "="):
+                out.append(a.split("=", 1)[1])
+            elif not f.startswith("--") and len(f) == 2 and a.startswith(f) and len(a) > 2 and e.cmd != "wget":
+                out.append(a[2:])  # curl -ox.sh
+    if e.cmd == "curl":  # clusters: -sSo x.sh, -sSLO
+        out += [args[k + 1] for k, a in enumerate(args[:-1]) if re.fullmatch(r"-[A-Za-z]+o", a) and a != "-o"]
+    if (e.cmd == "wget" and not out) or (e.cmd == "curl" and any(
+            a == "--remote-name" or re.fullmatch(r"-[A-Za-z]*O[A-Za-z]*", a) for a in args)):
+        out += _url_basename(args)
+    for k, w in enumerate(seg.words):
+        m = re.match(r"^>>?(.*)$", w)
+        if m:
+            out.append(m.group(1) or (seg.words[k + 1] if k + 1 < len(seg.words) else ""))
+    return [o for o in out if o]
+
+
+def _executed(e: Effective, seg: Segment) -> List[str]:
+    """Files a segment runs: a command word that is a path (`./x.sh`), or the script of sh / bash / python / source."""
+    raw = seg.words[len(seg.words) - len(e.args) - 1] if len(seg.words) > len(e.args) else ""
+    out = [raw] if ("/" in raw or "\\" in raw) else []
+    if e.cmd in _SHELLS or e.cmd in _PS or e.cmd in ("source", ".") or _INTERPRETERS.match(e.cmd):
+        pos = [a for a in e.args if not a.startswith("-")]
+        out += pos[:1]
+    return out
+
+
+def _check_download_exec(segs: List[Segment], ctx: ShellContext, out: List[Finding]) -> None:
+    """`curl -o x.sh URL && chmod +x x.sh && ./x.sh`: a file fetched and then run is remote code, like `curl | sh`."""
+    def key(p: str) -> str:
+        return paths.normalize(p, ctx.cwd, ctx.home) or p
+
+    fetched = set()
+    for seg in segs:
+        e = effective(seg.words)
+        if e and e.cmd:
+            fetched.update(key(f) for f in _downloaded(e, seg))
+    if not fetched:
+        return
+    for seg in segs:
+        e = effective(seg.words)
+        if e and e.cmd and any(key(x) in fetched for x in _executed(e, seg)):
+            out.append(Finding("shell-download-exec", "runs a file it just downloaded (download, chmod +x, run)", "shell"))
+            return
 
 
 def check_shell(command: str, ctx: Optional[ShellContext] = None) -> List[Finding]:
@@ -556,6 +678,7 @@ def check_shell(command: str, ctx: Optional[ShellContext] = None) -> List[Findin
     for k, seg in enumerate(segs):
         nxt = segs[k + 1] if seg.pipe_next and k + 1 < len(segs) else None
         _check_segment(seg, nxt, ctx, out)
+    _check_download_exec(segs, ctx, out)
     seen, uniq = set(), []
     for f in out:
         key = (f.rule, f.reason)

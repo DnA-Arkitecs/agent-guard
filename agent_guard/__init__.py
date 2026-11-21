@@ -5,5 +5,5 @@ from .session import Session, SessionStore
 from .sqlguard import check_sql
 from .types import Decision, Finding
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __all__ = ["Guard", "Policy", "AgentPolicy", "Session", "SessionStore", "Decision", "Finding", "check_sql", "__version__"]

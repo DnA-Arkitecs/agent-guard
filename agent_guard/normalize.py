@@ -10,7 +10,8 @@ Three tricks get past rules written for ASCII text, and each one is undone here 
 
 `fold()` strips (1) and maps (2) to ASCII; the guard runs every rule on the folded call. Two things are refused
 outright because folding alone would hide them: a word that mixes ASCII with look-alike letters (no real command,
-keyword or host is spelled that way), and a host that only reads as allowed after folding. `decoded_payloads()`
+keyword or host is spelled that way), and a host with a mixed-script label or a label that folds wholly to ASCII.
+A host written wholly in one non-Latin script (`пример.рф`) is a real IDN and passes. `decoded_payloads()`
 finds Base64 blobs, decodes them (UTF-8 or the UTF-16LE that PowerShell uses) up to two layers deep, and hands the
 text back so the guard judges it with the same shell, SQL and secret rules. Decoding never executes anything.
 """
@@ -90,8 +91,29 @@ def mixed_script_words(text: str) -> List[str]:
     return out
 
 
+def _scripts(label: str) -> set:
+    """The writing systems of a label's letters (LATIN, CYRILLIC, GREEK, ...) from their Unicode names."""
+    out = set()
+    for c in label:
+        if c.isalpha():
+            name = unicodedata.name(c, "")
+            out.add(name.split(" ", 1)[0] if name else "UNKNOWN")
+    return out
+
+
+def _spoofed_label(label: str) -> bool:
+    """A label that pretends to be ASCII: it mixes writing systems (`exаmple`, Latin with one Cyrillic `а`), or it
+    folds entirely to ASCII (`раураl` in Cyrillic reads as `paypal`; fullwidth `ｅｘａｍｐｌｅ`). A label written
+    wholly in one non-Latin script that stays non-ASCII after folding (`пример`) is an ordinary IDN label."""
+    if label.isascii():
+        return False
+    folded = fold(label)
+    return len(_scripts(label)) > 1 or (folded != label and folded.isascii())
+
+
 def spoofed_hosts(text: str) -> List[str]:
-    """Host-like tokens that change under folding: a look-alike, fullwidth or invisible character hides in them."""
+    """Host-like tokens that hide a look-alike, fullwidth or invisible character: an invisible character anywhere,
+    or any label that is mixed-script or folds to ASCII. Pure single-script IDN hosts (`пример.рф`) pass."""
     if not text or text.isascii():
         return []
     out = []
@@ -100,7 +122,7 @@ def spoofed_hosts(text: str) -> List[str]:
         hidden = visible != token  # an invisible character inside the token
         for m in _HOSTLIKE.finditer(visible):
             host = m.group(0)
-            if hidden or (not host.isascii() and fold(host) != host):
+            if hidden or any(_spoofed_label(lab) for lab in host.split(".")):
                 out.append(host)
     return out
 
@@ -159,8 +181,22 @@ def decoded_payloads(text: str) -> List[str]:
     return found
 
 
+_SQL_PREAMBLE = re.compile(
+    r"\s*(?:/\*.*?\*/|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|"
+    r"(?:BEGIN(?:\s+(?:TRANSACTION|WORK|TRAN))?|START\s+TRANSACTION[^;]*|SET\s[^;]*|USE\s[^;]*)\s*;)",
+    re.I | re.S)
+
+
 def looks_like_sql(text: str) -> bool:
-    return bool(_SQL_START.match(text or ""))
+    """SQL, also behind leading comments and session preambles (`/* x */`, `-- x`, `BEGIN;`, `START TRANSACTION;`,
+    `SET ROLE admin;`, `USE db;`)."""
+    text = text or ""
+    for _ in range(64):
+        m = _SQL_PREAMBLE.match(text)
+        if not m or not m.group(0):
+            break
+        text = text[m.end():]
+    return bool(_SQL_START.match(text))
 
 
 def walk(value: Any) -> Iterable[Tuple[str, str]]:

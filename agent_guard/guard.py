@@ -169,15 +169,19 @@ class Guard:
                 if "shell" in roles:
                     inner += self._shell({"command": text}, ap, session, ctx)
                     inner += check_shell("python3 -c " + shlex.quote(text), ctx)  # decoded inline code
-        rules = dict.fromkeys(f.rule for f in inner if f.rule not in ("sql-unterminated", "heredoc-unterminated"))
-        return [Finding("evasion-base64-payload", f"Base64 hides a blocked payload ({r})", "evasion") for r in rules]
+        rules = list(dict.fromkeys(f.rule for f in inner if f.rule not in ("sql-unterminated", "heredoc-unterminated")))
+        if not rules:
+            return []
+        return [Finding("evasion-base64-payload", f"Base64 hides a blocked payload ({', '.join(rules)})", "evasion")]
 
 
 def _dedupe(findings: List[Finding]) -> List[Finding]:
-    seen, out = set(), []
+    """One finding per rule id, in first-seen order; distinct reasons for the same rule are joined."""
+    order: Dict[str, Finding] = {}
     for f in findings:
-        key = (f.rule, f.reason)
-        if key not in seen:
-            seen.add(key)
-            out.append(f)
-    return out
+        first = order.get(f.rule)
+        if first is None:
+            order[f.rule] = f
+        elif f.reason not in first.reason.split("; "):
+            order[f.rule] = Finding(f.rule, first.reason + "; " + f.reason, first.category)
+    return list(order.values())

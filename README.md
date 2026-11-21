@@ -10,10 +10,10 @@ decision takes about 0.2 ms.
 ```bash
 python -m agent_guard --benchmark   # red-team suite: 50 hostile calls over 6 vectors + 40 benign, p50/p95/p99
 python -m agent_guard --demo        # quick replay: 20 hostile + 18 benign
-pytest -q                           # 175 tests
+pytest -q                           # 258 tests
 ```
 
-## v1.1 red-team benchmark
+## v1.1.1 red-team benchmark
 
 50 hostile calls across six attack vectors and 40 realistic engineering and ops calls (npm, make, docker,
 kubectl, git, jq, JOIN reports, scoped DELETE/UPDATE, Basic-auth headers, accented, Greek and Cyrillic text),
@@ -30,14 +30,38 @@ scope-escape               6/6
 
 true positives  : 50/50 (100.0%) blocked for the expected reason
 false positives : 0/40 (0.0%) benign calls blocked
-latency         : p50 161 us | p95 311 us | p99 424 us per decision
+latency         : p50 167 us | p95 315 us | p99 430 us per decision
 RESULT          : ALL PASS
 ```
 
 A hostile call counts only if it is blocked *by the rule meant to catch it*; blocked for a lucky side reason is a
-miss. Latency varies by machine and load: five runs on the machine above ranged p50 161 to 188 us and p99 422 to 459 us,
+miss. Latency varies by machine and load: five runs of v1.1.1 on the machine above ranged p50 167 to 193 us and p99 430 to 467 us,
 always under 0.5 ms. Every payload is
 synthetic (reserved example domains, a documented example key shape assembled at run time).
+
+### What changed in v1.1.1
+
+An independent review probed v1.1 and found real gaps. Each probe is now a test.
+
+- **Tautologies at any depth.** The WHERE judge used to split OR only at the top level and then strip parentheses,
+  so `WHERE (1=1 OR id=5)` and `WHERE id=5 AND (status='x' OR 1=1)` passed. It is now a recursive evaluator over
+  OR, AND, NOT and grouping parentheses, and it knows more always-true forms: `2 > 1`, `1+1=2`, `'a' LIKE 'a'`,
+  `u.id = u.id`, `1 IN (1)`, `1 NOT IN (2)`, `NULL IS NULL`, `TRUE IS TRUE`, `1 BETWEEN 0 AND 2`. An `OR` branch
+  that is always true is blocked even inside a group an outer `AND` narrows: that is the `OR 1=1` injection
+  signature, and no hand-written filter needs one.
+- **SQL behind a preamble.** Base64-hidden SQL is recognised behind leading `/* */`, `--` or `#` comments and
+  `BEGIN;`, `START TRANSACTION;`, `SET ROLE ...;` or `USE db;`.
+- **Shell.** `perl -e` / `perl -le` and `ruby -e` one-liners that unlink, `rm_rf`, `File.delete` or shell out
+  (`system "..."`, backticks, `%x(...)`) block like `python -c` ones. `git push --force-with-lease` blocks when it
+  targets a protected branch (`main`, `master`, `trunk`, `develop`, `prod`, `release/*` and similar) or names no
+  branch at all; `--force-with-lease origin feat` still passes. A file fetched with `curl -o`, `curl -O`, `wget`,
+  `-OutFile` or a `>` redirect and then run (`./x.sh`, `sh x.sh`, `python3 x.py`) blocks as
+  `shell-download-exec`.
+- **False positives removed.** `git restore --staged .` only unstages and passes (`--worktree` or no `--staged`
+  still blocks). A host written wholly in one non-Latin script (`пример.рф`) is an ordinary IDN and passes; a
+  label that mixes scripts or folds wholly to ASCII (`раураl.com`, fullwidth letters) is still refused. A Base64
+  payload that trips several rules now yields one `evasion-base64-payload` finding naming them all, and a
+  decision never lists the same rule id twice.
 
 ### What changed in v1.1
 
@@ -168,6 +192,16 @@ load time so a typo cannot silently weaken a rule.
   red-team. Bypasses are welcome as issues: each confirmed one becomes a benchmark case and a test.
 - Rules are conservative on purpose. A blocked benign call is cheap (add the host to the allowlist); an allowed
   hostile one is not.
+- **The exact WHERE policy.** A `DELETE` or `UPDATE` is blocked when its WHERE is always true at any depth, or
+  when any `OR` group inside it has a constant-true branch (`id=5 AND (x OR 1=1)`). `col IS NOT NULL` counts as
+  true only when it stands alone as the whole WHERE or as one whole `OR` branch of it (`WHERE user_id IS NOT NULL`
+  reaches every row that has a value, so it blocks); joined by `AND` to a real filter (`WHERE user_id IS NOT NULL
+  AND created_at < '2026-01-01'`) or used as one test inside an `OR` group beside a real column test, it passes. A
+  constant joined by `AND` (`WHERE 1=1 AND id = 5`, the query-builder prefix) passes. String literals are compared
+  by shape, not value, so `'a' = 'b'` also blocks (a no-op delete, refused fail-closed).
+- The WHERE judge reads the statement text only. It does not know a column's real values, so a filter that is
+  *effectively* every row (`WHERE created_at > '1900-01-01'`, `WHERE id > 0`) passes, as does arithmetic on
+  columns (`WHERE id = id + 0`) and functions (`WHERE COALESCE(1, 0) = 1`).
 
 ## Layout
 
