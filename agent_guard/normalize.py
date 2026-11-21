@@ -183,7 +183,7 @@ def decoded_payloads(text: str) -> List[str]:
 
 _SQL_PREAMBLE = re.compile(
     r"\s*(?:/\*.*?\*/|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|"
-    r"(?:BEGIN(?:\s+(?:TRANSACTION|WORK|TRAN))?|START\s+TRANSACTION[^;]*|SET\s[^;]*|USE\s[^;]*)\s*;)",
+    r"(?:BEGIN(?:\s+(?:TRANSACTION|WORK|TRAN))?\s*|START\s+TRANSACTION\b[^;]*|SET\s[^;]*|USE\s[^;]*);)",
     re.I | re.S)
 
 

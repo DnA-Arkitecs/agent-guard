@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 import operator
 import re
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .types import Finding
 
@@ -220,18 +220,30 @@ def _items(group: List[str]) -> Optional[List[List[str]]]:
     return items
 
 
-def _split_at(toks: List[str], words: Tuple[str, ...]) -> Optional[Tuple[List[str], str, List[str]]]:
-    """(left, operator, right) at the first top-level operator from `words` (multi-word operators are matched as a
-    run of tokens); None when there is none."""
+def _op_index(words: Tuple[str, ...]) -> Dict[str, List[Tuple[str, List[str]]]]:
+    index: Dict[str, List[Tuple[str, List[str]]]] = {}
+    for w in words:
+        parts = w.split()
+        index.setdefault(parts[0], []).append((w, parts))
+    return index
+
+
+_OP_INDEX = _op_index(_OPERATORS)
+_AND_INDEX = _op_index(("AND",))
+
+
+def _split_at(toks: List[str], index: Dict[str, List[Tuple[str, List[str]]]]
+              ) -> Optional[Tuple[List[str], str, List[str]]]:
+    """(left, operator, right) at the first top-level operator (multi-word operators are matched as a run of tokens);
+    None when there is none. Operators are indexed by first token, so the scan is one pass."""
     d = 0
     for k, t in enumerate(toks):
         if t == "(":
             d += 1
         elif t == ")":
             d -= 1
-        elif d == 0 and k:
-            for w in words:
-                parts = w.split()
+        elif d == 0 and k and t in index:
+            for w, parts in index[t]:
                 if toks[k:k + len(parts)] == parts:
                     return toks[:k], w, toks[k + len(parts):]
     return None
@@ -248,7 +260,7 @@ def _truth(atom: List[str], strict: bool) -> Optional[bool]:
         return c != 0  # `WHERE 1`, `WHERE 7`, `WHERE 0`
     if not toks or any(_bind(t) for t in toks):
         return None  # a bind parameter's value is not in the text
-    m = _split_at(toks, _OPERATORS)
+    m = _split_at(toks, _OP_INDEX)
     if not m:
         return None
     left, op, right = m
@@ -269,7 +281,7 @@ def _truth(atom: List[str], strict: bool) -> Optional[bool]:
             return (val == (right == ["TRUE"])) != neg  # `TRUE IS TRUE`, `1 IS NOT FALSE`
         return None
     if op in ("BETWEEN", "NOT BETWEEN"):
-        bounds = _split_at(right, ("AND",))
+        bounds = _split_at(right, _AND_INDEX)
         if not bounds:
             return None
         v, lo, hi = _const(left), _const(bounds[0]), _const(bounds[2])
@@ -406,6 +418,7 @@ def _judge(tokens: List[str], mode: str) -> List[Finding]:
     up = [t.upper() for t in tokens]
     first = up[0] if up else ""
     depths = _depths(tokens)
+    taut_found = False
     if mode == "read_only" and first not in READ_ONLY_FIRST:
         out.append(Finding("sql-write-in-read-only", f"{first or 'statement'} is not allowed for a read-only agent", "sql"))
     for i, t in enumerate(up):
@@ -424,7 +437,8 @@ def _judge(tokens: List[str], mode: str) -> List[Finding]:
             clause = _where_clause(tokens, depths, i)
             if clause is None:
                 out.append(Finding(f"sql-unscoped-{t.lower()}", f"{t} without a WHERE clause affects every row", "sql"))
-            elif not _scoped(clause):
+            elif not taut_found and not _scoped(clause):
+                taut_found = True  # one finding per statement is enough; later writes need not be re-judged
                 out.append(Finding("sql-tautology-where", f"{t} with an always-true WHERE affects every row", "sql"))
         elif t.lower() in ESCAPE_HATCHES:
             out.append(Finding(f"sql-{t.lower()}", f"{ESCAPE_HATCHES[t.lower()]} is blocked", "sql"))
@@ -442,12 +456,16 @@ def check_sql(sql: str, mode: str = "scoped_write") -> List[Finding]:
     if mode == "deny":
         return [Finding("sql-denied", "this agent may not run SQL", "sql")]
     findings: dict = {}
+    judged: set = set()
     parsed = 0
     for backslash, dashes, nested in itertools.product((False, True), repeat=3):
         text = _sanitise(sql or "", backslash, dashes, nested)
         if text is None:
             continue
         parsed += 1
+        if text in judged:
+            continue  # most readings agree: judge each distinct reading once
+        judged.add(text)
         for stmt in _split_statements(text):
             for f in _judge(stmt, mode):
                 findings.setdefault(f.rule, f)

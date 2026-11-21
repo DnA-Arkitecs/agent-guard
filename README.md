@@ -10,7 +10,7 @@ decision takes about 0.2 ms.
 ```bash
 python -m agent_guard --benchmark   # red-team suite: 50 hostile calls over 6 vectors + 40 benign, p50/p95/p99
 python -m agent_guard --demo        # quick replay: 20 hostile + 18 benign
-pytest -q                           # 258 tests
+pytest -q                           # 259 tests
 ```
 
 ## v1.1.1 red-team benchmark
@@ -30,12 +30,12 @@ scope-escape               6/6
 
 true positives  : 50/50 (100.0%) blocked for the expected reason
 false positives : 0/40 (0.0%) benign calls blocked
-latency         : p50 167 us | p95 315 us | p99 430 us per decision
+latency         : p50 161 us | p95 313 us | p99 429 us per decision
 RESULT          : ALL PASS
 ```
 
 A hostile call counts only if it is blocked *by the rule meant to catch it*; blocked for a lucky side reason is a
-miss. Latency varies by machine and load: five runs of v1.1.1 on the machine above ranged p50 167 to 193 us and p99 430 to 467 us,
+miss. Latency varies by machine and load: five runs of v1.1.1 on the machine above ranged p50 160 to 187 us and p99 426 to 464 us,
 always under 0.5 ms. Every payload is
 synthetic (reserved example domains, a documented example key shape assembled at run time).
 

@@ -610,6 +610,15 @@ def test_sql_real_filters_stay_allowed(where):
     assert check_sql(f"DELETE FROM users u WHERE {where}") == []
 
 
+def test_sql_recursive_judge_stays_fast_on_floods():
+    import time
+    for unit in ("UPDATE a WHERE ", "DELETE FROM t WHERE (", "DELETE FROM t WHERE 1=1 OR ", "DELETE FROM t WHERE x IN (1, "):
+        text = (unit * (2000 // len(unit) + 1))[:2000]
+        t0 = time.perf_counter()
+        check_sql(text)
+        assert time.perf_counter() - t0 < 0.25, unit
+
+
 def test_sql_is_not_null_alone_is_treated_as_every_row():
     # Documented policy: `col IS NOT NULL` as the whole WHERE reaches every row that has a value.
     assert "sql-tautology-where" in rules(check_sql("DELETE FROM sessions WHERE user_id IS NOT NULL"))
